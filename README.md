@@ -1,4 +1,4 @@
-# Real-Time E-Commerce Recommendation & Streaming ML Architecture
+# Real-Time Streaming E-Commerce ML Recommendation Architecture
 
 A Terraform-managed AWS data engineering and MLOps platform built around **10,000,000 simulated raw e-commerce events**, streaming ingestion, distributed feature engineering, collaborative filtering, and SageMaker model deployment.
 
