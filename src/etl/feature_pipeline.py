@@ -16,6 +16,13 @@ sc = SparkContext()
 glue_context = GlueContext(sc)
 spark = glue_context.spark_session
 
+# ---------------------------------------------------------
+# Enable Adaptive Query Execution (AQE) to prevent small files
+# ---------------------------------------------------------
+spark.conf.set("spark.sql.adaptive.enabled", "true")
+spark.conf.set("spark.sql.adaptive.coalescePartitions.enabled", "true")
+spark.conf.set("spark.sql.adaptive.advisoryPartitionSizeInBytes", "134217728")
+
 job = Job(glue_context)
 job.init(args["JOB_NAME"], args)
 
@@ -61,6 +68,10 @@ events = (
         F.when(F.col("event_type") == "add_to_cart", 1).otherwise(0),
     )
     .withColumn(
+        "remove_count",
+        F.when(F.col("event_type") == "remove_from_cart", 1).otherwise(0),
+    )
+    .withColumn(
         "purchase_count",
         F.when(F.col("event_type") == "purchase", 1).otherwise(0),
     )
@@ -81,6 +92,7 @@ interactions = (
     .agg(
         F.sum("view_count").alias("views"),
         F.sum("cart_count").alias("cart_adds"),
+        F.sum("remove_count").alias("removals"),
         F.sum("purchase_count").alias("purchases"),
         F.max("timestamp").alias("last_interaction"),
     )
@@ -90,9 +102,10 @@ interactions = (
 # ---------------------------------------------------------
 # 5. Create weighted implicit-feedback score
 #
-# Views       = 1 point
-# Cart adds   = 3 points
-# Purchases   = 5 points
+# Views         = 1 point
+# Cart adds     = 3 points
+# Cart removals = -1 point
+# Purchases     = 5 points
 # ---------------------------------------------------------
 
 interactions = interactions.withColumn(
@@ -100,6 +113,7 @@ interactions = interactions.withColumn(
     (
         F.col("views") * 1
         + F.col("cart_adds") * 3
+        - F.col("removals") * 1
         + F.col("purchases") * 5
     ),
 )
@@ -115,6 +129,7 @@ user_features = (
     .agg(
         F.sum("view_count").alias("total_views"),
         F.sum("cart_count").alias("total_cart_adds"),
+        F.sum("remove_count").alias("total_removals"),
         F.sum("purchase_count").alias("total_purchases"),
         F.sum(
             F.when(
@@ -166,26 +181,28 @@ user_features = (
 
 
 # ---------------------------------------------------------
-# 8. Write user features
+# 8. Write user features to Glue Data Catalog
 # ---------------------------------------------------------
 
 (
     user_features
     .write
     .mode("overwrite")
-    .parquet(f"{features_path}/user_features/")
+    .option("path", f"{features_path}/user_features/")
+    .saveAsTable("user_features")
 )
 
 
 # ---------------------------------------------------------
-# 9. Write recommendation interaction features
+# 9. Write recommendation interaction features to Catalog
 # ---------------------------------------------------------
 
 (
     interactions
     .write
     .mode("overwrite")
-    .parquet(f"{features_path}/interactions/")
+    .option("path", f"{features_path}/interactions/")
+    .saveAsTable("interaction_features")
 )
 
 

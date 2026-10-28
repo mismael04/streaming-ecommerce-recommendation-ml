@@ -1,6 +1,6 @@
 resource "aws_kinesis_stream" "events" {
   name             = "${local.name_prefix}-events"
-  shard_count      = 1
+  shard_count      = 8
   retention_period = 24
 
   encryption_type = "KMS"

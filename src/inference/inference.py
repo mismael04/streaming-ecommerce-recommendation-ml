@@ -93,4 +93,4 @@ def output_fn(prediction, accept):
     if accept != "application/json":
         raise ValueError(f"Unsupported accept type: {accept}")
 
-    return json.dumps(prediction), "application/json"
+    return json.dumps(prediction)

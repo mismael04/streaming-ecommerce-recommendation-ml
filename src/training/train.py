@@ -46,7 +46,7 @@ def temporal_split(df):
 
 def build_matrix(train):
     """
-    Create a user × product sparse interaction matrix.
+    Create a user x product sparse interaction matrix.
     """
 
     users = sorted(train["user_id"].unique())

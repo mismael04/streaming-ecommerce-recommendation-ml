@@ -1,64 +1,42 @@
+
 import json
 from pathlib import Path
 
-from inference import (
-    load_model,
-    input_fn,
-    output_fn,
-    predict_fn,
-)
+from inference import model_fn, input_fn, predict_fn, output_fn
 
 
 def main():
-    project_root = (
-        Path(__file__)
-        .resolve()
-        .parents[2]
-    )
-
+    # Resolve the project root and model artifacts directory.
+    project_root = Path(__file__).resolve().parents[2]
     model_dir = project_root / "models"
 
-    print("Loading model...")
+    # Load the trained recommender model.
+    artifact = model_fn(str(model_dir))
 
-    model = load_model(model_dir)
-
-    print("Model loaded successfully.")
-
-    # Simulate an API request.
-    request = {
+    # Simulate a SageMaker JSON request.
+    request_body = json.dumps({
         "user_id": "user_0001",
-        "k": 10,
-    }
+        "k": 5
+    }).encode("utf-8")
 
-    request_body = json.dumps(request)
-
-    print("\nRequest:")
-    print(request_body)
-
-    # Deserialize request.
+    # Parse the incoming request.
     input_data = input_fn(
         request_body,
-        "application/json",
+        "application/json"
     )
 
     # Generate recommendations.
-    prediction = predict_fn(
-        input_data,
-        model,
-    )
+    prediction = predict_fn(input_data, artifact)
 
-    # Serialize response.
-    response_body, content_type = output_fn(
+    # Format the response as JSON.
+    response = output_fn(
         prediction,
-        "application/json",
+        "application/json"
     )
 
-    print("\nResponse:")
-    print(response_body)
-
-    print(
-        f"\nContent type: {content_type}"
-    )
+    print("Inference test successful.")
+    print("Response:")
+    print(json.dumps(json.loads(response), indent=2))
 
 
 if __name__ == "__main__":

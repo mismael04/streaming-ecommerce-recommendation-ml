@@ -9,7 +9,7 @@ def test_recommendation_endpoint():
     # Initialize the SageMaker runtime client
     client = boto3.client("sagemaker-runtime", region_name=region)
 
-    # Sample payload matching your inference schema
+    # Sample payload matching inference schema
     payload = {
         "user_id": "user_0001",
         "k": 5

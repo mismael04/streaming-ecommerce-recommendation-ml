@@ -11,13 +11,31 @@ resource "aws_kinesis_firehose_delivery_stream" "events_to_s3" {
     role_arn   = aws_iam_role.firehose.arn
     bucket_arn = aws_s3_bucket.raw.arn
 
-    prefix              = "events/year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/"
+    prefix = "events/year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/"
+
     error_output_prefix = "errors/"
 
-    buffering_size     = 1
-    buffering_interval = 60
+    # Buffer for up to 128 MB or 15 minutes,
+    # whichever condition triggers delivery first.
+    buffering_size     = 128
+    buffering_interval = 900
 
     compression_format = "GZIP"
+
+    # Separate JSON records with newline delimiters
+    # so Spark and Athena can read them as JSON Lines.
+    processing_configuration {
+      enabled = true
+
+      processors {
+        type = "AppendDelimiterToRecord"
+
+        parameters {
+          parameter_name  = "Delimiter"
+          parameter_value = "\\n"
+        }
+      }
+    }
 
     cloudwatch_logging_options {
       enabled         = true

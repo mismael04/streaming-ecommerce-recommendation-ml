@@ -1,217 +1,304 @@
+
 import json
 import random
 import time
-from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timedelta, timezone
 
 import boto3
+from botocore.config import Config
 
-REGION = "us-east-1"
+
+# ---------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------
+
 STREAM_NAME = "recommendation-streaming-platform-dev-events"
 
-NUM_USERS = 3_000
-NUM_EVENTS = 80_000
-
-# Keep batches below the maximum PutRecords batch size and
-# throttle the producer so one Kinesis shard is not overwhelmed.
+TOTAL_EVENTS = 10_000_000
+CHUNK_SIZE = 10_000
 BATCH_SIZE = 100
-BATCH_DELAY_SECONDS = 0.25
+MAX_WORKERS = 8
 
-USERS = [f"user_{i:04d}" for i in range(1, NUM_USERS + 1)]
+# Initial attempt plus up to this many retries.
+MAX_RECORD_RETRIES = 10
+RETRY_BASE_SECONDS = 0.25
+
+NUM_USERS = 10_000
+NUM_PRODUCTS = 75
 
 CATEGORIES = [
-    "headphones",
-    "speakers",
-    "laptops",
-    "phones",
-    "gaming",
-    "books",
-    "tablets",
-    "cameras",
-    "smart_home",
-    "accessories",
+    f"category_{index:02d}"
+    for index in range(1, 11)
 ]
-
-BASE_PRICES = {
-    "headphones": 149.99,
-    "speakers": 129.99,
-    "laptops": 999.99,
-    "phones": 799.99,
-    "gaming": 199.99,
-    "books": 24.99,
-    "tablets": 399.99,
-    "cameras": 699.99,
-    "smart_home": 99.99,
-    "accessories": 49.99,
-}
-
-PRODUCTS = []
-
-for i in range(1, 76):
-    category = CATEGORIES[(i - 1) % len(CATEGORIES)]
-
-    price = BASE_PRICES[category] * random.uniform(0.7, 1.4)
-
-    PRODUCTS.append(
-        {
-            "id": f"product_{i:03d}",
-            "category": category,
-            "price": round(price, 2),
-        }
-    )
-
-# Give each user two preferred categories.
-# These preferences are intentionally hidden from the generated
-# events. The model should eventually infer them from user behavior.
-USER_PREFERENCES = {
-    user: random.sample(CATEGORIES, 2)
-    for user in USERS
-}
 
 EVENT_TYPES = [
     "view",
-    "view",
-    "view",
-    "view",
     "add_to_cart",
-    "add_to_cart",
+    "remove_from_cart",
     "purchase",
 ]
 
-kinesis = boto3.client("kinesis", region_name=REGION)
+EVENT_WEIGHTS = [0.70, 0.12, 0.05, 0.13]
 
 
-def choose_product(user_id):
-    """
-    Select a product based on the user's hidden preferences.
+# ---------------------------------------------------------
+# Synthetic users and product catalog
+# ---------------------------------------------------------
 
-    Approximately 80% of interactions come from preferred
-    categories, while 20% come from any category.
-    """
-    preferred_categories = USER_PREFERENCES[user_id]
+USERS = [
+    f"user_{index:04d}"
+    for index in range(1, NUM_USERS + 1)
+]
 
-    if random.random() < 0.80:
-        category = random.choice(preferred_categories)
+PRODUCTS = []
 
-        category_products = [
-            product
-            for product in PRODUCTS
-            if product["category"] == category
-        ]
+for index in range(1, NUM_PRODUCTS + 1):
+    category = CATEGORIES[(index - 1) % len(CATEGORIES)]
 
-        return random.choice(category_products)
+    PRODUCTS.append({
+        "product_id": f"product_{index:04d}",
+        "category": category,
+        "price": round(random.uniform(10.0, 500.0), 2),
+    })
 
-    return random.choice(PRODUCTS)
+PRODUCTS_BY_CATEGORY = {
+    category: [
+        product
+        for product in PRODUCTS
+        if product["category"] == category
+    ]
+    for category in CATEGORIES
+}
+
+# Give each user a preferred category to create
+# a little structure in the synthetic interactions.
+USER_PREFERENCES = {
+    user_id: random.choice(CATEGORIES)
+    for user_id in USERS
+}
 
 
-def generate_event():
-    """Generate a single synthetic user interaction."""
+# ---------------------------------------------------------
+# Kinesis client
+# ---------------------------------------------------------
 
-    user = random.choice(USERS)
-    product = choose_product(user)
-    event_type = random.choice(EVENT_TYPES)
+kinesis = boto3.client(
+    "kinesis",
+    config=Config(
+        retries={
+            "mode": "standard",
+            "max_attempts": 10,
+        },
+        connect_timeout=10,
+        read_timeout=60,
+    ),
+)
+
+
+# ---------------------------------------------------------
+# Generate one event
+# ---------------------------------------------------------
+
+def generate_event(rng):
+    user_id = rng.choice(USERS)
+    preferred_category = USER_PREFERENCES[user_id]
+
+    # Most interactions use the user's preferred category.
+    if rng.random() < 0.65:
+        product = rng.choice(
+            PRODUCTS_BY_CATEGORY[preferred_category]
+        )
+    else:
+        product = rng.choice(PRODUCTS)
+
+    event_time = (
+        datetime.now(timezone.utc)
+        - timedelta(
+            seconds=rng.randint(0, 30 * 24 * 60 * 60)
+        )
+    )
 
     return {
-        "event_id": f"{user}_{random.getrandbits(64)}",
-        "user_id": user,
-        "product_id": product["id"],
+        "user_id": user_id,
+        "product_id": product["product_id"],
+        "event_type": rng.choices(
+            EVENT_TYPES,
+            weights=EVENT_WEIGHTS,
+            k=1,
+        )[0],
         "category": product["category"],
-        "event_type": event_type,
         "price": product["price"],
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "timestamp": event_time.isoformat(
+            timespec="seconds"
+        ).replace("+00:00", "Z"),
     }
 
 
-def send_batch(events):
-    """
-    Send a batch of events to Kinesis.
+# ---------------------------------------------------------
+# Convert an event into a Kinesis record
+# ---------------------------------------------------------
 
-    Kinesis PutRecords can partially fail, so only failed records
-    are retried. Exponential backoff helps when the shard is
-    temporarily throttling the producer.
-    """
+def to_kinesis_record(event):
+    return {
+        "Data": json.dumps(
+            event,
+            separators=(",", ":"),
+        ).encode("utf-8"),
+        "PartitionKey": event["user_id"],
+    }
 
-    retry_records = [
-        {
-            "Data": (json.dumps(event) + "\n").encode("utf-8"),
-            "PartitionKey": event["user_id"],
-        }
-        for event in events
-    ]
 
-    max_retries = 6
+# ---------------------------------------------------------
+# Send one batch, retrying only failed records
+# ---------------------------------------------------------
 
-    for attempt in range(max_retries + 1):
+def send_batch(records):
+    pending = records
+    attempt = 0
+
+    while pending:
         response = kinesis.put_records(
             StreamName=STREAM_NAME,
-            Records=retry_records,
+            Records=pending,
         )
 
-        failed_count = response["FailedRecordCount"]
+        results = response.get("Records", [])
 
-        if failed_count == 0:
-            return
-
-        retry_records = [
-            record
-            for record, result in zip(
-                retry_records,
-                response["Records"],
-            )
-            if "ErrorCode" in result
-        ]
-
-        if attempt == max_retries:
+        if len(results) != len(pending):
             raise RuntimeError(
-                f"{len(retry_records)} records failed after "
-                f"{max_retries} retries."
+                "Kinesis returned a different number of "
+                "results than records submitted."
             )
 
-        delay = min(2**attempt, 10)
+        failed_records = []
+        failure_details = []
 
-        print(
-            f"Warning: {failed_count} records throttled. "
-            f"Retrying in {delay}s..."
+        for record, result in zip(pending, results):
+            if result.get("ErrorCode"):
+                failed_records.append(record)
+                failure_details.append({
+                    "code": result.get("ErrorCode"),
+                    "message": result.get("ErrorMessage"),
+                })
+
+        if not failed_records:
+            # All records in this batch were acknowledged.
+            return len(records)
+
+        if attempt >= MAX_RECORD_RETRIES:
+            raise RuntimeError(
+                f"Kinesis could not accept "
+                f"{len(failed_records)} record(s) after "
+                f"{MAX_RECORD_RETRIES} retries. "
+                f"Example errors: {failure_details[:3]}"
+            )
+
+        attempt += 1
+        pending = failed_records
+
+        # Exponential backoff with a maximum delay.
+        delay = min(
+            RETRY_BASE_SECONDS * (2 ** (attempt - 1)),
+            10.0,
         )
 
-        time.sleep(delay)
+        # Add jitter so concurrent workers do not all retry
+        # at precisely the same time.
+        time.sleep(delay + random.uniform(0, delay * 0.25))
 
+    return len(records)
+
+
+# ---------------------------------------------------------
+# Generate and send the complete dataset
+# ---------------------------------------------------------
 
 def main():
-    print(
-        f"Generating {NUM_EVENTS:,} additional events "
-        f"for {NUM_USERS:,} users..."
-    )
+    rng = random.Random()
+
+    print("Starting synthetic event ingestion.")
+    print(f"Kinesis stream: {STREAM_NAME}")
+    print(f"Target events: {TOTAL_EVENTS:,}")
     print(f"Batch size: {BATCH_SIZE}")
-    print(f"Batch delay: {BATCH_DELAY_SECONDS}s")
-    print(f"Products: {len(PRODUCTS)}")
-    print(f"Categories: {len(CATEGORIES)}")
-    print("Starting Kinesis ingestion...")
+    print(f"Concurrent workers: {MAX_WORKERS}")
+    print()
 
-    batch = []
+    total_acknowledged = 0
 
-    for i in range(NUM_EVENTS):
-        event = generate_event()
-        batch.append(event)
+    with ThreadPoolExecutor(
+        max_workers=MAX_WORKERS
+    ) as executor:
 
-        if len(batch) == BATCH_SIZE:
-            send_batch(batch)
-            batch.clear()
-
-            # Keep the producer below the sustained write capacity
-            # of the single Kinesis shard.
-            time.sleep(BATCH_DELAY_SECONDS)
-
-        if (i + 1) % 5_000 == 0:
-            print(
-                f"Sent {i + 1:,}/{NUM_EVENTS:,} "
-                f"additional events"
+        for chunk_start in range(
+            0,
+            TOTAL_EVENTS,
+            CHUNK_SIZE,
+        ):
+            chunk_count = min(
+                CHUNK_SIZE,
+                TOTAL_EVENTS - chunk_start,
             )
 
-    # Send any remaining events.
-    if batch:
-        send_batch(batch)
+            events = [
+                generate_event(rng)
+                for _ in range(chunk_count)
+            ]
 
-    print("Additional event generation complete.")
+            records = [
+                to_kinesis_record(event)
+                for event in events
+            ]
+
+            batches = [
+                records[index:index + BATCH_SIZE]
+                for index in range(
+                    0,
+                    len(records),
+                    BATCH_SIZE,
+                )
+            ]
+
+            futures = [
+                executor.submit(send_batch, batch)
+                for batch in batches
+            ]
+
+            chunk_acknowledged = 0
+
+            for future in as_completed(futures):
+                # Raises immediately if a batch exhausts retries.
+                chunk_acknowledged += future.result()
+
+            total_acknowledged += chunk_acknowledged
+
+            print(
+                f"Progress: {total_acknowledged:,} / "
+                f"{TOTAL_EVENTS:,} records acknowledged "
+                f"({total_acknowledged / TOTAL_EVENTS:.1%})"
+            )
+
+            if chunk_acknowledged != chunk_count:
+                raise RuntimeError(
+                    f"Chunk count mismatch: expected "
+                    f"{chunk_count:,}, acknowledged "
+                    f"{chunk_acknowledged:,}."
+                )
+
+    if total_acknowledged != TOTAL_EVENTS:
+        raise RuntimeError(
+            f"Ingestion incomplete: expected "
+            f"{TOTAL_EVENTS:,}, acknowledged "
+            f"{total_acknowledged:,}."
+        )
+
+    print()
+    print("Producer finished successfully.")
+    print(f"Records acknowledged by Kinesis: {total_acknowledged:,}")
+    print(
+        "Important: wait for Firehose to flush its remaining "
+        "buffer before validating the final S3 count."
+    )
 
 
 if __name__ == "__main__":

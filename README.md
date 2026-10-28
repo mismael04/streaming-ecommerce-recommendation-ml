@@ -1,288 +1,252 @@
 # Real-Time E-Commerce Recommendation & Streaming ML Architecture
 
-A Terraform-managed AWS MLOps platform demonstrating **real-time event ingestion, distributed feature engineering, collaborative filtering, model packaging, and automated SageMaker deployment**.
+A Terraform-managed AWS data engineering and MLOps platform built around **10,000,000 simulated raw e-commerce events**, streaming ingestion, distributed feature engineering, collaborative filtering, and SageMaker model deployment.
 
-The project implements an end-to-end recommendation pipeline in which simulated e-commerce interactions are streamed through **Amazon Kinesis Data Firehose**, persisted to **Amazon S3**, transformed with **AWS Glue and PySpark**, and used to train a collaborative filtering recommendation model using **TruncatedSVD**.
+The platform streams user interactions through **Amazon Kinesis Data Streams and Amazon Kinesis Data Firehose**, stores raw events in Amazon S3, and processes them using **AWS Glue and PySpark**. The resulting datasets support a personalized recommendation model built with **TruncatedSVD**, packaged for SageMaker inference, and deployed through Terraform-managed AWS infrastructure.
 
-The resulting model artifact is packaged into a SageMaker-compatible model bundle and deployed to an **Amazon SageMaker real-time inference endpoint** using Terraform. The project also includes separate local inference tests and cloud integration tests to validate the model-serving pipeline.
-
----
+The project combines streaming ingestion, distributed batch feature engineering, model training, artifact packaging, and synchronous cloud inference. Kinesis supports continuous event ingestion, while Glue processes the accumulated data through Spark jobs rather than continuously updating features for each incoming event.
 
 ## Architecture & Data Flow
 
 ```mermaid
-graph LR
+graph TD
+    A["Python Event Simulator<br/>10,000,000 Raw Events"]
+    B["Amazon Kinesis Data Streams<br/>Streaming Ingestion"]
+    C["Amazon Kinesis Data Firehose<br/>Buffering & S3 Delivery"]
+    D["Amazon S3<br/>Raw JSON Events"]
+    E["AWS Glue + PySpark<br/>Distributed Feature Engineering"]
+    F["Amazon S3<br/>Curated Parquet Features"]
+    G["Amazon Athena<br/>SQL Analytics & Validation"]
+    H["Training Pipeline<br/>TruncatedSVD"]
+    I["Model Artifact<br/>recommender.joblib"]
+    J["Model Packaging<br/>model.tar.gz"]
+    K["Amazon SageMaker<br/>Model & Real-Time Endpoint"]
+    L["Inference Client<br/>boto3 & Tests"]
 
-    A[Event Simulator] --> B[Amazon Kinesis<br/>Data Firehose]
-    B --> C[Amazon S3<br/>Raw Events]
+    A --> B --> C --> D --> E --> F
+    F --> G
+    F --> H --> I --> J --> K --> L
 
-    C --> D[AWS Glue<br/>PySpark ETL]
-    D --> E[Amazon S3<br/>Curated Interactions]
-
-    E --> F[Training Pipeline<br/>TruncatedSVD]
-    F --> G[Model Artifact<br/>recommender.joblib]
-
-    G --> H[Model Packaging<br/>model.tar.gz]
-    H --> I[Amazon SageMaker<br/>Model]
-    I --> J[SageMaker<br/>Real-Time Endpoint]
-
-    J --> K[Inference Client<br/>boto3 / Tests]
-
-    style B fill:#FF9900,stroke:#232F3E,stroke-width:2px,color:#000
-    style D fill:#FF9900,stroke:#232F3E,stroke-width:2px,color:#000
-    style F fill:#232F3E,stroke:#FF9900,stroke-width:2px,color:#fff
-    style H fill:#3F8624,stroke:#232F3E,stroke-width:2px,color:#fff
-    style J fill:#00A4E4,stroke:#232F3E,stroke-width:2px,color:#fff
+    style A fill:#232F3E,stroke:#FF9900,color:#fff
+    style B fill:#FF9900,stroke:#232F3E,color:#000
+    style C fill:#FF9900,stroke:#232F3E,color:#000
+    style E fill:#FF9900,stroke:#232F3E,color:#000
+    style G fill:#232F3E,stroke:#FF9900,color:#fff
+    style H fill:#232F3E,stroke:#FF9900,color:#fff
+    style J fill:#3F8624,stroke:#232F3E,color:#fff
+    style K fill:#00A4E4,stroke:#232F3E,color:#fff
 ```
 
-### Data Flow
+## Data Flow
 
-1. **Event Simulation & Streaming Ingestion — Amazon Kinesis & Firehose**
+### 1. Event Generation — Python
 
-   The project generates simulated e-commerce interaction events representing user behavior such as product views, cart additions, and purchases.
+The event simulator generates **10,000,000 simulated raw e-commerce interaction events** representing user behavior, including product views, cart additions, and purchases.
 
-   Events are streamed through **Amazon Kinesis Data Firehose** and delivered to an S3 raw-data bucket.
+The simulator sends events into the streaming ingestion infrastructure using a user-based partition key.
 
-2. **Distributed Feature Engineering — AWS Glue & PySpark**
+### 2. Streaming Ingestion — Amazon Kinesis Data Streams
 
-   The AWS Glue PySpark job in `feature_pipeline.py` processes the raw interaction events.
+Kinesis Data Streams receives events and provides the streaming layer between event generation and downstream delivery.
 
-   The pipeline:
+The stream is configured with eight shards to support partitioned ingestion. Using `user_id` as the partition key maps events from the same user to the same shard while the partition-key mapping remains unchanged.
 
-   * Reads raw JSON event data
-   * Validates incoming records
-   * Applies interaction weighting
-   * Aggregates user-product interactions
-   * Builds behavioral features
-   * Writes curated datasets to S3 as compressed Parquet
+Kinesis Data Streams and Firehose have distinct responsibilities: Data Streams ingests and retains records, while Firehose handles downstream delivery.
 
-3. **Model Training — TruncatedSVD**
+### 3. Buffered Delivery — Amazon Kinesis Data Firehose
 
-   The training pipeline in `train.py` consumes the curated interaction data and constructs a sparse user-item interaction matrix.
+Kinesis Data Firehose consumes the stream and delivers records to Amazon S3.
 
-   The recommendation model uses **TruncatedSVD** for matrix factorization.
+The delivery configuration includes:
 
-   The training process uses a temporal split designed to prevent future interactions from leaking into the training set. For each user, earlier interactions are used for training while the user's latest interaction is reserved for evaluation.
+- Buffering and batching before S3 delivery
+- GZIP compression
+- Record-delimiter processing for newline-delimited JSON
+- Date-based S3 prefixes
+- Terraform-managed delivery configuration
 
-4. **Model Packaging — SageMaker Artifact**
+The resulting raw events are stored in S3 for downstream processing.
 
-   The trained recommendation model is serialized as:
+### 4. Distributed Feature Engineering — AWS Glue & PySpark
 
-   ```text
-   recommender.joblib
-   ```
+The AWS Glue Spark job in `src/etl/feature_pipeline.py` processes raw JSON events and generates curated feature datasets.
 
-   The deployment script `package_model.py` packages the model together with the custom inference handler into:
+The pipeline performs operations such as:
 
-   ```text
-   model.tar.gz
-   ```
+- Reading raw events from S3
+- Validating records and handling malformed or incomplete data
+- Applying implicit-feedback weights to behavioral interactions
+- Aggregating user-product interactions
+- Generating user-level behavioral features
+- Applying Spark optimizations, including Adaptive Query Execution where configured
+- Writing curated datasets as compressed Parquet to S3
 
-   The resulting artifact is structured for Amazon SageMaker model hosting.
+The curated datasets provide a more compact analytical representation of the raw event stream.
 
-5. **Cloud Serving — Amazon SageMaker**
+This stage uses distributed Spark processing, but it is job-based rather than continuous per-event stream processing.
 
-   Terraform provisions the SageMaker model and real-time inference endpoint.
+### 5. Analytical Access — Amazon Athena
 
-   The packaged model is loaded by the custom inference handler and exposed through the SageMaker endpoint.
+Amazon Athena supports SQL queries over curated Parquet datasets stored in S3.
 
-6. **Local & Cloud Validation**
+The feature datasets can be registered as queryable tables, including `default.user_features` and `default.interaction_features`, where those names match the deployed Glue Data Catalog configuration.
 
-   The project separates local model/inference validation from cloud integration testing.
+Athena provides a serverless SQL layer for inspecting processed data, validating schemas, and analyzing feature-engineering output.
 
-   `test_inference.py` validates the inference pipeline locally, while `test_endpoint.py` sends requests to the deployed SageMaker endpoint using `boto3`.
+### 6. Recommendation Model Training — TruncatedSVD
+
+The training pipeline in `src/training/train.py` consumes curated interaction data and constructs a sparse user-item interaction matrix.
+
+The model uses **TruncatedSVD** to factorize the matrix into a lower-dimensional representation. These latent factors are used to estimate preference scores for candidate products.
+
+The pipeline includes temporal evaluation logic and a global popularity baseline for comparison.
+
+The trained model is serialized to:
+
+`models/recommender.joblib`
+
+### 7. Model Evaluation and Packaging
+
+Model evaluation is implemented in `src/models/evaluate_metrics.py`.
+
+The evaluation workflow validates the serialized model and compares recommendation performance against a global popularity baseline. Actual performance metrics should be reported only when confirmed by the evaluation output.
+
+The deployment script, `src/deployment/package_model.py`, packages the model and custom inference handler into a SageMaker-compatible archive:
+
+`build/model.tar.gz`
+
+The archive contains the model and inference code required to load the artifact and generate recommendations in the serving environment.
+
+### 8. Cloud Deployment — Amazon SageMaker
+
+Terraform provisions the SageMaker model, endpoint configuration, and real-time inference endpoint through `infrastructure/sagemaker.tf`.
+
+The hosted inference handler loads the packaged model, processes incoming requests, generates recommendation scores, and filters previously interacted-with products where supported by the stored model data.
+
+The endpoint provides synchronous inference: a client submits a request and receives a response without waiting for a new training run.
+
+This does not, by itself, guarantee that recommendations immediately reflect the latest incoming events. That depends on how the serving system accesses and refreshes interaction data and features.
+
+### 9. Local and Cloud Inference Testing
+
+The project separates local inference testing from cloud integration testing:
+
+- `src/inference/test_inference.py` tests the local inference path.
+- `src/inference/test_endpoint.py` sends requests to the deployed SageMaker endpoint using `boto3`.
+
+This separation helps distinguish local inference correctness from successful cloud deployment and endpoint integration.
 
 ---
 
 ## Technology Stack
 
-| Technology                       | Purpose                                               |
-| -------------------------------- | ----------------------------------------------------- |
-| **Terraform**                    | Infrastructure as Code and AWS resource orchestration |
-| **Amazon Kinesis Data Firehose** | Streaming event ingestion                             |
-| **Amazon S3**                    | Raw event storage and curated feature storage         |
-| **AWS Glue**                     | Managed ETL and distributed data processing           |
-| **PySpark**                      | Distributed feature engineering                       |
-| **scikit-learn**                 | TruncatedSVD collaborative filtering                  |
-| **SciPy**                        | Sparse user-item interaction matrices                 |
-| **Amazon SageMaker**             | Model hosting and real-time inference                 |
-| **boto3**                        | AWS SDK for Python                                    |
-| **AWS IAM**                      | Service authorization and execution roles             |
-| **Python**                       | Simulation, ETL, training, inference, and testing     |
-
----
+| Technology | Purpose |
+|---|---|
+| Terraform | Infrastructure as Code and AWS resource provisioning |
+| Amazon Kinesis Data Streams | Streaming ingestion and partitioned event handling |
+| Amazon Kinesis Data Firehose | Buffering, compression, and S3 delivery |
+| Amazon S3 | Raw event storage, curated datasets, and model artifacts |
+| AWS Glue | Managed Spark ETL execution |
+| PySpark | Distributed transformation and feature engineering |
+| Amazon Athena | Serverless SQL analysis of curated datasets |
+| scikit-learn | TruncatedSVD model training and recommendation scoring |
+| SciPy | Sparse user-item interaction matrices |
+| Amazon SageMaker | Hosted model inference |
+| boto3 | AWS SDK and endpoint integration testing |
+| AWS IAM | Service roles and permissions |
+| Amazon CloudWatch | Service monitoring where configured |
+| Python | Event simulation, training, inference, and testing |
 
 ## Infrastructure as Code
 
-Terraform manages the AWS infrastructure required for the data and machine-learning pipeline.
+Terraform manages the AWS resources required for the streaming and machine-learning pipeline. The configurations are organized under `infrastructure/`.
 
-### Storage
+### Storage — `s3.tf` and `features.tf`
 
-`s3.tf` and `features.tf` define the S3-based storage layer used for:
+Define the S3 storage layer for raw events, curated features, and model artifacts, along with associated feature-data resources.
 
-* Raw streaming events
-* Curated interaction data
-* Feature datasets
-* Model artifacts
+### Streaming — `kinesis.tf` and `firehose.tf`
 
-### Streaming
+Separate streaming ingestion from delivery:
 
-`kinesis.tf` and `firehose.tf` define the streaming ingestion infrastructure used to deliver simulated events into S3.
+- `kinesis.tf` manages Kinesis Data Streams resources and associated configuration.
+- `firehose.tf` manages Firehose delivery to S3, including buffering, compression, and record-delivery settings.
 
-### Data Processing
+### Data Processing — `glue.tf`
 
-`glue.tf` provisions the AWS Glue resources required for the PySpark feature-engineering pipeline.
+Provisions AWS Glue resources used to run the PySpark feature-engineering job.
 
-### IAM
+### Security — `iam.tf`
 
-`iam.tf` defines the service roles and permissions required by AWS services throughout the pipeline.
+Defines service roles and permissions required by the streaming, processing, and model-serving components.
 
-### SageMaker
+### Model Serving — `sagemaker.tf`
 
-`sagemaker.tf` provisions the SageMaker model and endpoint infrastructure required for real-time inference.
+Provisions the SageMaker model and endpoint resources used to serve the packaged recommendation model.
 
-### Configuration & Governance
+### Configuration and Monitoring
 
-Additional Terraform files provide:
+Additional configuration files support resource naming, outputs, variables, tagging, monitoring, and environment configuration.
 
-* Audit configuration
-* Resource naming
-* Tags
-* Outputs
-* Variables
-* Environment configuration
-
-The infrastructure can therefore be reproduced through Terraform rather than relying exclusively on manually configured AWS resources.
-
----
+Terraform makes the infrastructure reproducible rather than relying entirely on manually created AWS resources.
 
 ## Machine Learning Design
 
 ### Collaborative Filtering
 
-The recommendation system models relationships between users and products using implicit behavioral signals.
+The recommendation system learns latent representations from user-product interaction data.
 
-The interaction matrix follows the general structure:
+A simplified interaction matrix looks like this:
 
-```text
-              Product A   Product B   Product C
-User 1            5           0           1
-User 2            0           3           5
-User 3            1           0           5
-```
+| User | Product A | Product B | Product C |
+|---|---:|---:|---:|
+| User 1 | 5 | 0 | 1 |
+| User 2 | 0 | 3 | 5 |
+| User 3 | 1 | 0 | 5 |
 
-Higher values represent stronger engagement with a product.
+Higher values indicate stronger observed engagement, while zero represents the absence of an aggregated interaction in this illustrative matrix.
 
-The resulting sparse matrix is factorized using **TruncatedSVD** to learn lower-dimensional representations of the interaction data.
-
----
+TruncatedSVD factorizes the matrix into lower-dimensional representations used to estimate preference scores for candidate products.
 
 ### Implicit Feedback Weighting
 
-Instead of treating every interaction equally, the pipeline assigns different weights according to behavioral strength:
+The feature pipeline assigns weights to behavioral events according to their intended strength of engagement.
 
 | Interaction | Weight |
-| ----------- | -----: |
-| View        |      1 |
-| Cart Add    |      3 |
-| Purchase    |      5 |
+|---|---:|
+| Product view | 1 |
+| Cart addition | 3 |
+| Purchase | 5 |
+| Cart removal | -1 |
 
-This provides the recommendation model with a stronger signal for interactions that indicate greater user intent.
+These are heuristic preference signals rather than calibrated probabilities of purchase.
 
----
+### Temporal Evaluation
 
-### Temporal Train/Test Split
-
-The evaluation process uses a temporal split rather than randomly dividing interactions.
-
-For each user:
+The evaluation workflow uses temporal splitting so the model is evaluated against interactions occurring after the information available during training.
 
 ```text
-Earlier interactions → Training data
-Latest interaction   → Test data
+Earlier interactions → Training
+Latest interaction   → Evaluation
 ```
 
-This prevents the model from training on interactions that occur after the event being evaluated.
-
-The approach better represents a recommendation scenario in which the system must generate recommendations using information available before a user's future interaction.
-
----
+This helps reduce future-information leakage compared with randomly splitting interactions across time.
 
 ### Popularity Baseline
 
-Model performance is compared against a simple global popularity recommendation baseline.
+The collaborative-filtering model is evaluated against a global popularity baseline. This helps determine whether personalization adds value beyond recommending products that are popular across the dataset.
 
-This provides a reference point for determining whether the learned collaborative-filtering model provides additional signal beyond recommending globally popular products.
-
----
-
-## Model Evaluation
-
-Model evaluation is separated into `evaluate_metrics.py`.
-
-The evaluation process treats the serialized model artifact as the object being validated rather than relying exclusively on the in-memory training object.
-
-This mirrors a production-oriented MLOps workflow:
-
-```text
-Training
-   ↓
-Model Artifact
-   ↓
-Validation
-   ↓
-Packaging
-   ↓
-Deployment
-   ↓
-Inference
-```
-
-Separating artifact evaluation from training helps validate the actual model that will be packaged and deployed.
-
----
-
-## Model Packaging
-
-The deployment process separates the trained model from the training environment.
-
-The packaging pipeline produces:
-
-```text
-recommender.joblib
-        ↓
-package_model.py
-        ↓
-model.tar.gz
-        ↓
-SageMaker Model
-        ↓
-SageMaker Endpoint
-```
-
-The model bundle contains the serialized recommendation model and the custom inference code required to load the artifact and generate recommendations.
-
-This allows the same model artifact to be tested locally before being deployed to SageMaker.
+Actual Precision@K, Recall@K, or other performance metrics should be included only when supported by evaluation results.
 
 ---
 
 ## Testing Strategy
 
-The project uses two complementary testing paths.
-
 ### Local Inference Testing
 
-`test_inference.py` validates the inference code locally.
+Tests model loading, input parsing, recommendation generation, and output formatting without requiring an active SageMaker endpoint.
 
-This allows the following to be tested without an active AWS endpoint:
-
-* Model loading
-* Input parsing
-* Recommendation generation
-* Output formatting
-* Inference logic
-
-Run:
+Run from the repository root:
 
 ```bash
 python src/inference/test_inference.py
@@ -290,45 +254,27 @@ python src/inference/test_inference.py
 
 ### Cloud Integration Testing
 
-`test_endpoint.py` sends inference requests to the deployed SageMaker endpoint.
+Invokes the deployed SageMaker endpoint using `boto3` to validate the client-to-endpoint request and response path.
 
-This validates the complete cloud serving path:
-
-```text
-Client
-  ↓
-boto3
-  ↓
-SageMaker Endpoint
-  ↓
-Inference Handler
-  ↓
-Model Artifact
-  ↓
-Recommendations
-```
-
-Run:
+Run from the repository root:
 
 ```bash
 python src/inference/test_endpoint.py
 ```
 
-This separates **local model validation** from **cloud integration testing**.
+The AWS credentials and permissions used by the test must allow invocation of the endpoint.
 
 ---
 
 ## Project Structure
 
 ```text
-real-time-recommendation-streaming-ml/
+recommendation-streaming-platform/
 │
 ├── build/
-│
-├── data/
+│   └── model.tar.gz
 │
 ├── infrastructure/
-│   ├── audit.tf
 │   ├── features.tf
 │   ├── firehose.tf
 │   ├── glue.tf
@@ -336,6 +282,7 @@ real-time-recommendation-streaming-ml/
 │   ├── kinesis.tf
 │   ├── locals.tf
 │   ├── main.tf
+│   ├── monitoring.tf
 │   ├── outputs.tf
 │   ├── s3.tf
 │   ├── sagemaker.tf
@@ -369,176 +316,139 @@ real-time-recommendation-streaming-ml/
 │
 ├── .gitignore
 ├── README.md
-├── requirements.txt
-└── terraform.tfstate
+└── requirements.txt
 ```
-
-> **Note:** Local virtual environments, generated datasets, build caches, model artifacts, and Terraform state should generally be excluded from version control through `.gitignore`. The exact repository contents may therefore differ from the structure shown above.
 
 ---
 
-## Deployment & Testing
+## Deployment & Execution
 
-### 1. Clone the Repository
+### 1. Configure AWS Access
 
-```bash
-git clone https://github.com/YOUR_USERNAME/real-time-recommendation-streaming-ml.git
+Configure AWS credentials and select the intended region. Verify that the identity has the permissions required to provision and operate the resources.
 
-cd real-time-recommendation-streaming-ml
-```
+### 2. Initialize and Validate Terraform
 
-### 2. Initialize Terraform
-
-Navigate to the Terraform configuration:
+From the repository root:
 
 ```bash
 cd infrastructure
-```
-
-Initialize Terraform:
-
-```bash
 terraform init
-```
-
-Review the planned infrastructure:
-
-```bash
+terraform validate
 terraform plan
 ```
 
-Deploy the AWS infrastructure:
+Review the planned resources and costs before deployment.
+
+### 3. Provision Infrastructure
 
 ```bash
 terraform apply
 ```
 
-### 3. Generate Streaming Events
+Ensure that the streaming infrastructure is ready before running the simulator.
 
-Run the event simulator according to the configuration in `src/simulator/`.
+### 4. Generate Streaming Events
 
-The simulator generates user interaction events representing:
+From the repository root:
 
-* Product views
-* Cart additions
-* Purchases
+```bash
+python src/simulator/event_generator.py
+```
 
-These events are sent through the streaming ingestion pipeline and delivered to S3.
+Install the simulator's dependencies from `src/simulator/requirements.txt` if they are separate from the root requirements.
 
-### 4. Run the Feature Pipeline
+The workload targets 10,000,000 raw events. Actual counts should be confirmed from the simulator output and delivered data.
 
-After the required raw event data is available in S3, run the AWS Glue PySpark feature-engineering job.
+### 5. Run the Glue Feature Pipeline
 
-The pipeline processes raw interaction events and produces curated Parquet interaction data for model training.
+After raw event data has been delivered to S3, start the configured Glue job through the AWS Console or CLI.
 
-### 5. Train the Recommendation Model
+For example, if the deployed job name is `recommendation-streaming-platform-dev-feature-pipeline`:
 
-From the project root:
+```bash
+aws glue start-job-run \
+  --job-name recommendation-streaming-platform-dev-feature-pipeline
+```
+
+Wait for the job to finish successfully before querying the curated datasets or training the model.
+
+### 6. Validate the Curated Data
+
+Use Athena to inspect the registered tables and confirm that the curated datasets contain the expected columns and records.
+
+Verify the Glue output paths and table schemas before model training.
+
+### 7. Train and Evaluate the Model
+
+From the repository root:
 
 ```bash
 python src/training/train.py
+python src/models/evaluate_metrics.py
 ```
 
-This produces the serialized recommendation model:
+Confirm that training produces `models/recommender.joblib` and that evaluation completes successfully.
 
-```text
-models/recommender.joblib
-```
-
-### 6. Package the Model
-
-Run:
+### 8. Package the Model
 
 ```bash
 python src/deployment/package_model.py
 ```
 
-This creates the SageMaker-compatible deployment artifact:
+This should produce `build/model.tar.gz`, assuming the packaging script's prerequisites are satisfied.
 
-```text
-build/model.tar.gz
+### 9. Deploy or Update the Model
+
+Ensure the packaged artifact is available at the S3 location expected by the Terraform configuration. Then run:
+
+```bash
+cd infrastructure
+terraform plan
+terraform apply
 ```
 
-### 7. Test Inference Locally
+Verify that the SageMaker model references the correct artifact and that Terraform applies the intended model or endpoint update.
 
-Run:
+### 10. Test Inference
+
+From the repository root:
 
 ```bash
 python src/inference/test_inference.py
-```
-
-This validates the inference handler and model artifact without requiring a live SageMaker endpoint.
-
-### 8. Test the Live SageMaker Endpoint
-
-After the endpoint has been deployed and is available:
-
-```bash
 python src/inference/test_endpoint.py
 ```
 
-This sends a test request to the deployed endpoint using `boto3`.
+The first command tests local inference; the second requires a deployed, available SageMaker endpoint and appropriate AWS permissions.
 
 ---
 
 ## Engineering Highlights
 
-### End-to-End Streaming ML Architecture
-
-Connects event generation, streaming ingestion, cloud storage, distributed feature engineering, model training, artifact packaging, deployment, and inference into a single cloud architecture.
-
-### Distributed Feature Engineering
-
-Uses AWS Glue and PySpark to transform raw interaction events into curated machine-learning features.
-
-### Collaborative Filtering
-
-Implements matrix factorization using TruncatedSVD and sparse user-item interaction matrices.
-
-### Temporal Evaluation
-
-Uses temporal train/test splitting to reduce the risk of future-information leakage during model evaluation.
-
-### Baseline Benchmarking
-
-Compares recommendation performance against a simple global popularity baseline.
-
-### Artifact-Based Deployment
-
-Separates the trained model artifact from the training environment and packages it for independent serving.
-
-### Infrastructure as Code
-
-Uses Terraform to provision and configure the AWS infrastructure required by the data and ML pipeline.
-
-### Local vs. Cloud Testing
-
-Separates local inference testing from live SageMaker integration testing to validate both model behavior and cloud deployment.
-
----
+- **10 million raw events:** A large simulated interaction workload used to exercise the streaming pipeline.
+- **Separated streaming responsibilities:** Kinesis Data Streams handles ingestion, while Firehose handles buffering and delivery to S3.
+- **Distributed feature engineering:** AWS Glue and PySpark transform raw events into curated datasets.
+- **Analytical data access:** Athena supports SQL-based inspection and validation of processed Parquet data.
+- **Collaborative filtering:** TruncatedSVD generates personalized recommendation scores from sparse user-item interactions.
+- **Temporal evaluation:** Time-aware splitting helps reduce future-information leakage.
+- **Baseline benchmarking:** A popularity-based recommender provides a reference for evaluating personalization.
+- **Artifact-based deployment:** Model serialization and packaging separate training from inference.
+- **Infrastructure as Code:** Terraform manages the AWS resources required by the platform.
+- **Independent testing:** Local inference and live cloud integration are validated separately.
 
 ## Key Takeaways
 
-This project demonstrates practical experience with:
+This project demonstrates hands-on experience with:
 
-* **AWS Data Engineering**
-* **Real-Time Event Streaming**
-* **Amazon Kinesis Data Firehose**
-* **Amazon S3**
-* **AWS Glue**
-* **PySpark**
-* **Distributed Feature Engineering**
-* **Collaborative Filtering**
-* **Matrix Factorization**
-* **TruncatedSVD**
-* **Sparse Matrices**
-* **Amazon SageMaker**
-* **Custom Model Inference**
-* **Model Packaging**
-* **Terraform / Infrastructure as Code**
-* **AWS IAM**
-* **boto3**
-* **ML Model Evaluation**
-* **Cloud Integration Testing**
+- AWS data engineering and streaming architecture
+- Kinesis Data Streams and Kinesis Data Firehose
+- S3 storage and data delivery
+- AWS Glue, PySpark, and distributed ETL
+- Parquet feature datasets and Athena
+- Sparse matrices and collaborative filtering
+- TruncatedSVD model training and evaluation
+- SageMaker model packaging and hosted inference
+- Terraform-based AWS infrastructure
+- IAM permissions and cloud integration testing
 
-The central engineering objective is to demonstrate how **streaming behavioral data can move through a cloud-native data pipeline into a deployable recommendation system**, while maintaining reproducible infrastructure and clear separation between data ingestion, feature engineering, model training, artifact validation, deployment, and production inference.
+The central engineering objective is to demonstrate how **10,000,000 raw behavioral events can flow through a cloud-based streaming and feature-engineering pipeline into a deployable recommendation system**, with distinct ingestion, delivery, processing, training, packaging, and serving components.
